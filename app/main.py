@@ -19,6 +19,6 @@ async def on_message(message):
     if message.content.startswith('$hello'):
         await message.channel.send('Hello!')
 
-# Koyeb用 サーバー立ち上げ
+# サーバー起動
 server_thread()
 client.run(TOKEN)
