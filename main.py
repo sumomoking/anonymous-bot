@@ -1,4 +1,5 @@
 import os
+import time
 import hashlib
 import discord
 from discord import app_commands
@@ -8,6 +9,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
+# 起動ごとに変わるユニークなソルト（再起動トリガー用）
+BOOT_SALT = str(int(time.time()))
+
 # アイコン用絵文字プール
 AVATAR_EMOJIS = [
     "🤖", "👾", "👻", "🦊", "🐼", "🐨", "🐸", "🦉",
@@ -16,8 +20,13 @@ AVATAR_EMOJIS = [
     "🎩", "🎭", "🎃", "🌵", "🥑", "🧁"
 ]
 
+# 12時間周期 ＋ Bot再起動時に自動ローテーションする識別情報生成
 def get_anon_identity(user_id: int, room_name: str) -> tuple[str, str]:
-    seed = f"{user_id}:{room_name}"
+    # 12時間（43200秒）ごとに加算されるウィンドウ値
+    time_window = int(time.time() // 43200)
+
+    # ユーザーID・部屋名・12時間枠・起動ソルトを混合
+    seed = f"{user_id}:{room_name}:{time_window}:{BOOT_SALT}"
     hash_obj = hashlib.sha256(seed.encode())
     hash_int = int(hash_obj.hexdigest(), 16)
 
@@ -40,11 +49,10 @@ class LeaveView(discord.ui.View):
         else:
             await interaction.response.send_message("ここは匿名個室ではありません。", ephemeral=True)
 
-# 募集メッセージ用の参加ボタンView（再起動後も壊れない設計）
+# 募集メッセージ用の参加ボタンView
 class JoinView(discord.ui.View):
     def __init__(self, room_name: str = ""):
         super().__init__(timeout=None)
-        # room_nameが渡された場合（/create時）にボタンを追加
         if room_name:
             self.add_item(
                 discord.ui.Button(
@@ -58,7 +66,9 @@ class JoinView(discord.ui.View):
 # 個人部屋作成
 async def create_user_room(guild: discord.Guild, member: discord.Member, room_name: str, base_channel: discord.TextChannel):
     emoji, anon_name = get_anon_identity(member.id, room_name)
-    topic = f"anon_isolated:{room_name}:{member.id}"
+    current_window = int(time.time() // 43200)
+    # トピック末尾に「ウィンドウ番号:起動ソルト」を保持
+    topic = f"anon_isolated:{room_name}:{member.id}:{current_window}:{BOOT_SALT}"
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -80,7 +90,7 @@ async def create_user_room(guild: discord.Guild, member: discord.Member, room_na
 
     await private_ch.send(
         f"🔒 **「{room_name}」へようこそ**\n"
-        f"あなたのアバター: {emoji} **{anon_name}**\n\n"
+        f"現在のアバター: {emoji} **{anon_name}**（※12時間ごと/再起動時に自動シャッフル）\n\n"
         f"・メンバーリストにはあなたとBotしか表示されません。\n"
         f"・送信したメッセージ・画像は参加者全員の部屋へサイレント転送されます。\n"
         f"・抜けるときは下のボタン、または `/leave` で退出できます（全員退出で部屋は消滅します）。",
@@ -118,17 +128,15 @@ class AnonBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # 永続View（退出ボタン）を登録
         self.add_view(LeaveView())
         await self.tree.sync()
         print("スラッシュコマンド同期完了")
 
 bot = AnonBot()
 
-# ボタンクリック検知処理（安全なインタラクションハンドリング）
+# ボタンクリック検知
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
-    # ボタン操作の場合
     if interaction.type == discord.InteractionType.component:
         custom_id = interaction.data.get("custom_id", "")
         if custom_id.startswith("anon_join:"):
@@ -137,9 +145,9 @@ async def on_interaction(interaction: discord.Interaction):
             member = interaction.user
             current_ch = interaction.channel
 
-            my_room_topic = f"anon_isolated:{room_name}:{member.id}"
+            user_prefix = f"anon_isolated:{room_name}:{member.id}:"
             for ch in guild.text_channels:
-                if ch.topic == my_room_topic:
+                if ch.topic and ch.topic.startswith(user_prefix):
                     await interaction.response.send_message(f"すでにあなたの部屋（{ch.mention}）があります！", ephemeral=True)
                     return
 
@@ -150,9 +158,8 @@ async def on_interaction(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    print(f"=== Botログイン完了: {bot.user} ===")
+    print(f"=== Botログイン完了 (Boot Salt: {BOOT_SALT}): {bot.user} ===")
 
-# 権限エラーハンドリング
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
@@ -172,19 +179,18 @@ async def create(interaction: discord.Interaction, room_name: str):
     member = interaction.user
     current_ch = interaction.channel
 
-    my_room_topic = f"anon_isolated:{room_name}:{member.id}"
+    user_prefix = f"anon_isolated:{room_name}:{member.id}:"
     for ch in guild.text_channels:
-        if ch.topic == my_room_topic:
+        if ch.topic and ch.topic.startswith(user_prefix):
             await interaction.response.send_message(f"すでに「{room_name}」用のあなたの部屋（{ch.mention}）が存在します！", ephemeral=True)
             return
 
     await interaction.response.defer(ephemeral=True)
 
-    # 参加ボタン付きでアナウンス
     await current_ch.send(
         f"🎉 **完全匿名部屋「{room_name}」がオープンしました！**\n"
         f"下のボタンを押すだけで、あなた専用の個室が生成されます。\n"
-        f"※他人の視線やタイピング表示は一切ありません。全員退出で自動消滅します。",
+        f"※他人の視線やタイピング表示は一切ありません。アイコン・IDは12時間ごと/再起動時に自動シャッフルされます。",
         view=JoinView(room_name=room_name)
     )
 
@@ -201,34 +207,50 @@ async def leave(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ここは匿名個人部屋ではありません。", ephemeral=True)
 
-# 3. チャット同期配信（画像・ファイル対応 ＆ ボイスチャンネル除外）
+# 3. チャット同期配信（再起動/時間経過のアバター変更検知 ＆ 画像転送対応）
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 通常のテキストチャンネル以外（VC内チャットやDMなど）は安全に無視する
     if not isinstance(message.channel, discord.TextChannel):
         return
 
-    # 匿名部屋からの発言か判定
     if message.channel.topic and message.channel.topic.startswith("anon_isolated:"):
         parts = message.channel.topic.split(":")
         room_name = parts[1]
         sender_id = message.author.id
 
-        # テキストも画像もない場合は無視
         if not message.content and not message.attachments:
             return
 
-        emoji, anon_name = get_anon_identity(sender_id, room_name)
+        current_window = int(time.time() // 43200)
+        
+        # トピックから前回のウィンドウ値とソルトを抽出
+        last_window = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else current_window
+        last_salt = parts[4] if len(parts) >= 5 else BOOT_SALT
 
+        # 12時間経過、またはBot再起動（ソルト変化）があった場合
+        if current_window != last_window or last_salt != BOOT_SALT:
+            new_emoji, new_anon_name = get_anon_identity(sender_id, room_name)
+            await message.channel.send(
+                f"🔄 **アバターが新しく更新されました！**\n"
+                f"新しいアバター: {new_emoji} **{new_anon_name}**",
+                silent=True
+            )
+            # トピックを最新状態に上書き
+            try:
+                await message.channel.edit(topic=f"anon_isolated:{room_name}:{sender_id}:{current_window}:{BOOT_SALT}")
+            except Exception as e:
+                print(f"トピック更新エラー: {e}")
+
+        # 送信メッセージの整形
+        emoji, anon_name = get_anon_identity(sender_id, room_name)
         if message.content:
             broadcast_content = f"{emoji} **[{anon_name}]**: {message.content}"
         else:
             broadcast_content = f"{emoji} **[{anon_name}]**:"
 
-        # 添付ファイルを取得
         files_to_send = []
         for att in message.attachments:
             try:
@@ -236,13 +258,11 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 print(f"ファイル取得エラー: {e}")
 
-        # 本人の打ったメッセージを削除（痕跡消去）
         try:
             await message.delete()
         except Exception:
             pass
 
-        # 同じ部屋の全個室へサイレント送信
         target_prefix = f"anon_isolated:{room_name}:"
         for ch in message.guild.text_channels:
             if ch.topic and ch.topic.startswith(target_prefix):
